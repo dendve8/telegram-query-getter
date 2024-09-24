@@ -1,73 +1,54 @@
-import { Api, TelegramClient } from "telegram";
-import { FloodWaitError } from "telegram/errors";
-import logger from "../utils/logger";
-import { Entity, EntityLike } from "telegram/define";
-import { Helper } from "../utils/helper";
-import input from "input"; // npm i input
-import { botUrlList } from "../utils/bot_url_list";
+import logger from "../utils/logger.js";
+import { Helper } from "../utils/helper.js";
+import { Api } from "telegram";
+import { FloodWaitError } from "telegram/errors/RPCErrorList.js";
+import fs from 'fs';
+import path from 'path';
 
 export class Core {
-  client: TelegramClient;
-  session: string;
-  peer: EntityLike | Entity | any;
-  bot: any;
-  url: any;
-  user: any;
+  /** @type {TelegramClient} */
+  client;
+  /** @type {string} */
+  session;
+  /** @type {EntityLike | Entity} */
+  peer;
+  /** @type {any} */
+  bot;
+  /** @type {any} */
+  url;
+  /** @type {boolean} */
+  useDefaultQueryType;
 
-  constructor(client: TelegramClient, session: string) {
+  constructor(client, session, bot, url, useDefaultQueryType) {
     this.client = client;
     this.session = session;
-  }
-
-  async mode() {
-    const mode = await input.text(
-      "Connect Mode : \n1. Manual \n2. List \n\nInput your choice : "
-    );
-
-    if (mode == 1) {
-      return true;
-    } else if (mode == 2) {
-      return false;
-    } else {
-      console.error("Invalid choice, Please try again");
-      await this.mode();
-    }
-  }
-
-  async botList() {
-    let botOptions = "Bot List:\n";
-    botUrlList.forEach((item, index) => {
-      botOptions += `${index + 1}. ${item.bot}\n`;
-    });
-
-    const bot = await input.text(`${botOptions}\nInput your choice: `);
-    const chosenBot = botUrlList[parseInt(bot) - 1];
-
-    if (chosenBot) {
-      this.bot = chosenBot.bot;
-      this.url = chosenBot.url;
-    } else {
-      console.error("Invalid choice. Please try again.");
-      await this.botList();
-    }
+    this.bot = bot;
+    this.url = url;
+    this.useDefaultQueryType = useDefaultQueryType;
   }
 
   async resolvePeer() {
     logger.info(`Session ${this.session} - Resolving Peer`);
-    while (this.peer == undefined) {
+    let attempts = 0;
+    const maxAttempts = 5;
+
+    while (this.peer == undefined && attempts < maxAttempts) {
       try {
         this.peer = await this.client.getEntity(this.bot);
         break;
       } catch (error) {
         if (error instanceof FloodWaitError) {
           const fls = error.seconds;
-
-          logger.warn(
-            `${this.client.session.serverAddress} | FloodWait ${error}`
-          );
+          logger.warn(`${this.client.session.serverAddress} | FloodWait ${error}`);
           logger.info(`${this.client.session.serverAddress} | Sleep ${fls}s`);
-
           await Helper.sleep((fls + 3) * 1000);
+        } else if (error.message.includes('TIMEOUT')) {
+          attempts++;
+          console.error('\x1b[31m%s\x1b[0m', 'TIMEOUT'); // Display TIMEOUT in red
+          if (attempts >= maxAttempts) {
+            throw new Error('Maximum attempts reached for resolving peer');
+          }
+          await Helper.sleep(5000); // Wait before retrying
         } else {
           throw error;
         }
@@ -79,31 +60,14 @@ export class Core {
     try {
       logger.info(`Session ${this.session} - Processing`);
       this.user = await this.client.getMe();
-      console.log("User Phone : " + this.user.phone);
-      if (await this.mode()) {
-        this.bot = await input.text("Enter bot username you want to connect ?");
-        this.url = await input.text(
-          "Enter bot Web apps URL you want to connect ?"
-        );
-      } else {
-        await this.botList();
-      }
 
-      if (!this.bot && !this.url) {
-        throw Error("You need to set Bot Username and Bot Web Apps URL");
+      if (!this.bot || !this.url) {
+        throw new Error("You need to set Bot Username and Bot Web Apps URL");
       }
-
-      const user = await this.client.getMe();
-      console.log("USER INFO");
-      console.log("Username : " + user.username);
-      console.log("Phone    : " + user.phone);
-      console.log();
 
       await this.resolvePeer();
-      console.log("PEER INFO");
-      console.log(`BOT    :  ${this.peer ? this.peer.username : "??"}`);
-      console.log();
       logger.info(`Session ${this.session} - Connecting to Webview`);
+      
       const webView = await this.client.invoke(
         new Api.messages.RequestWebView({
           peer: this.peer,
@@ -116,24 +80,45 @@ export class Core {
       logger.info(`Session ${this.session} - Webview Connected`);
 
       const authUrl = webView.url;
+      const tgData = Helper.getTelegramQuery(authUrl, this.useDefaultQueryType);
+      
+      // Save query data to a text file
+      const filename = `query_${this.bot}.txt`;
+      fs.appendFileSync(filename, JSON.stringify(tgData, null, 2) + '\n');
+      logger.info(`Session ${this.session} - Query data appended to ${filename}`);
 
-      const type = await input.text(
-        "Select Query Result Type ?\n \n1. URI Component \n2. JSON String\n3. Init Params (DEFAULT)\n \nPlease select result type :"
-      );
-
-      const tgData = Helper.getTelegramQuery(authUrl, type);
-      console.log();
-      console.log("WebView URL:", authUrl);
-      console.log();
-      console.log("TG Web App Data : " + tgData);
-      console.log();
-      logger.info(`Session ${this.session} Data - ${tgData}`);
-      logger.info(`Session ${this.session} - Complete`);
-      await this.client.disconnect();
-      logger.info(`BOT FINISH`);
+      return tgData; // Return query data for aggregation
     } catch (error) {
       console.error("Error during process execution:", error);
+      logger.error(`Session ${this.session} Error - ${error.message}`);
       throw error;
+    } finally {
+      try {
+        await this.client.disconnect();
+        logger.info(`Session ${this.session} - Client disconnected`);
+      } catch (disconnectError) {
+        console.error("Error disconnecting client:", disconnectError);
+        logger.error(`Session ${this.session} - Error disconnecting client: ${disconnectError}`);
+      }
     }
   }
 }
+
+// Function to loop through multiple sessions
+async function processMultipleSessions(sessions) {
+  for (const session of sessions) {
+    const core = new Core(session.client, session.session, session.bot, session.url, session.useDefaultQueryType);
+    try {
+      await core.process();
+    } catch (error) {
+      logger.error(`Error processing session ${session.session}: ${error.message}`);
+    }
+  }
+}
+
+// Example usage
+const sessions = [
+  // Add your session objects here
+];
+
+processMultipleSessions(sessions);
